@@ -22,9 +22,10 @@ import os
 import re
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 AGENT_ID = "ollama"
 AGENT_NAME = "Ollama Cloud"
@@ -263,8 +264,29 @@ def read_key_file(path: str) -> str:
         return handle.read().strip()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect before the follow-up request is built.
+
+    The stock handler copies req.headers (including Authorization) onto the
+    follow-up request, so a 301/302/307/308 from ollama.com would forward
+    the API key to whatever host the Location header names. Returning None
+    makes any redirect surface as an HTTPError instead: the request fails
+    loudly and the key never leaves ollama.com.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def fetch_usage(api_key: str) -> dict:
-    """Call /api/usage with the key injected only as an HTTP header."""
+    """Call /api/usage with the key injected only as an HTTP header.
+
+    Refuses redirects: the API key must never be forwarded to another host
+    on a 301/302/307/308 from ollama.com (open redirect or hijacked host).
+    """
     request = Request(
         USAGE_URL,
         headers={
@@ -273,7 +295,7 @@ def fetch_usage(api_key: str) -> dict:
             "Accept": "application/json",
         },
     )
-    with urlopen(request, timeout=REQUEST_TIMEOUT_SEC) as response:
+    with _NO_REDIRECT_OPENER.open(request, timeout=REQUEST_TIMEOUT_SEC) as response:
         payload = response.read(MAX_RESPONSE_BYTES + 1)
     if len(payload) > MAX_RESPONSE_BYTES:
         raise RuntimeError("usage response exceeded the 256 KiB cap")

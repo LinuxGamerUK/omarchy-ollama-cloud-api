@@ -94,8 +94,11 @@ run `python3 <plugin-dir>/collect.py --clear` to drop the usage record).
 - **Key handling.** The personal API key is never logged, echoed, or placed
   on a command line (process `argv` is world-readable via
   `/proc/<pid>/cmdline` on Linux). urllib injects it directly as the
-  `Authorization` header inside the collector process. The state record
-  written to `~/.local/state/` contains usage numbers only, never the key.
+  `Authorization` header inside the collector process, and **redirects are
+  refused** — a 301/302/307/308 from ollama.com fails the request instead
+  of forwarding the header to whatever host the `Location` names. The state
+  record written to `~/.local/state/` contains usage numbers only, never
+  the key.
 - **Bounded I/O.** Collector output is capped at the OS pipe level
   (`head -c`), wrapped in process-group-aware `timeout -k 2 N` with a QML
   watchdog fallback, API responses are capped at 256 KiB, parsed model
