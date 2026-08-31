@@ -58,6 +58,28 @@ The refresh button in the agents panel (`r`) triggers a fetch; otherwise the
 service refetches every 15 minutes. On failure the last good usage record is
 kept so the chip never goes blank; without a key the panel shows setup help.
 
+### Reset countdowns
+
+The `/api/usage` response carries usage fractions but no reset timestamps —
+Ollama only renders those on `ollama.com/settings` (a browser-cookie page).
+To show "Resets in …" under each bar, the collector extrapolates from a
+one-off seed and keeps correcting itself:
+
+```sh
+# read the two reset lines on https://ollama.com/settings, then run:
+python3 <plugin-dir>/collect.py --seed-resets session=52m --seed-resets weekly=4d6h
+```
+
+- The seed value becomes the anchor; afterwards every anchor advances by its
+  window period (5-hour session, 7-day weekly).
+- Whenever the usage fraction DROPS between polls the window must have
+  rolled, so the anchor is re-pinned from the observation — small seeding
+  inaccuracies self-correct over time.
+- Without a seed (or with an expired one) the reset lines are omitted rather
+  than misleading. Stored anchors live in
+  `~/.local/state/omarchy/agents/usage/ollama-resets.json` (usage numbers
+  only, no key).
+
 ## Uninstall
 
 Remove the plugin folder (and, if you no longer want the Ollama Cloud tab,

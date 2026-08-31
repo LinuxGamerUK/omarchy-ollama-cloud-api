@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import time
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -109,6 +111,119 @@ def resolve_api_key(cli_key_file: str) -> str:
     if dsh_key:
         return dsh_key
     raise RuntimeError(ENV_HINTS)
+
+
+# ── Reset-window anchors ────────────────────────────────────────────────
+# /api/usage carries usage fractions but no "resets at" timestamps — those
+# only exist on ollama.com/settings ("Resets in 1 hour", "Resets in 6 days").
+# The collector therefore extrapolates from a one-off seed taken from that
+# page (--seed-resets session=52m --seed-resets weekly=4d6h) and keeps the
+# anchors honest afterwards: a usage fraction that DROPS between polls means
+# the window rolled, so the anchor is re-pinned at the observed sample.
+SESSION_PERIOD_SEC = 5 * 3600
+WEEKLY_PERIOD_SEC = 7 * 24 * 3600
+RESET_STATE_FILE = "ollama-resets.json"
+RESET_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(d|h|m|s)", re.I)
+RESET_UNITS = {"d": 86400.0, "h": 3600.0, "m": 60.0, "s": 1.0}
+
+
+def reset_state_path() -> str:
+    return os.path.join(os.path.dirname(usage_record_path()), RESET_STATE_FILE)
+
+
+def load_reset_state() -> dict:
+    try:
+        with open(reset_state_path(), "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+            return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_reset_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(reset_state_path()), exist_ok=True)
+    tmp = f"{reset_state_path()}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, reset_state_path())
+
+
+def parse_duration(text: str) -> float:
+    """'52m', '1h43m', '6d' → seconds (0 for unparseable input)."""
+    total = 0.0
+    for value, unit in RESET_DURATION_RE.findall(str(text or "")):
+        total += float(value) * RESET_UNITS[unit.lower()]
+    return total
+
+
+def seed_resets(specs: list[str]) -> None:
+    """--seed-resets session=52m --seed-resets weekly=4d6h taken from the
+    settings page at roughly this moment."""
+    state = load_reset_state()
+    now = time.time()
+    for spec in specs or []:
+        key, _, value = spec.strip().partition("=")
+        key = key.strip().lower()
+        seconds = parse_duration(value)
+        if key not in ("session", "weekly") or seconds <= 0:
+            raise ValueError(
+                f"--seed-resets wants session=<duration> or weekly=<duration>"
+                f" (d/h/m/s), got {spec!r}"
+            )
+        period = SESSION_PERIOD_SEC if key == "session" else WEEKLY_PERIOD_SEC
+        state[key] = {"anchorEpoch": now + seconds, "periodSec": period}
+    save_reset_state(state)
+    print(
+        "ollama-cloud-usage: seeded reset anchors"
+        + (f": {', '.join(s for s in specs if s)}" if specs else ""),
+        file=sys.stderr,
+    )
+
+
+def reset_iso(state: dict, key: str, period: float, usage, now: float) -> str:
+    """Next reset timestamp for a window, '' when unknown.
+
+    A drop in the usage fraction between the previous sample and now means
+    the window rolled since that sample: re-pin the anchor at `now` (error
+    is bounded by the poll interval) and let the next period carry on."""
+    entry = state.get(key) if isinstance(state.get(key), dict) else {}
+    anchor = float(entry.get("anchorEpoch") or 0.0)
+    prev = state.get("prev") if isinstance(state.get("prev"), dict) else {}
+    prev_usage = prev.get(key)
+    dropped = (
+        isinstance(usage, (int, float))
+        and isinstance(prev_usage, (int, float))
+        and usage < prev_usage - 1e-9
+    )
+    if dropped or (anchor and anchor <= now):
+        # Window rolled since the previous sample (or the estimate expired):
+        # re-pin at `now`; the error is bounded by the poll interval.
+        anchor = now + period
+    if not anchor or anchor <= now:
+        return ""
+    return datetime.fromtimestamp(anchor, tz=timezone.utc).astimezone().isoformat(
+        timespec="seconds"
+    )
+
+
+def apply_reset_anchors(record: dict) -> dict:
+    """Attach resetsAt (estimated) to the record's limits; store samples."""
+    state = load_reset_state()
+    now = time.time()
+    limits = record.get("limits") or []
+    for entry in limits:
+        key = str(entry.get("title") or "").lower()
+        if key == "session":
+            entry["resetsAt"] = reset_iso(state, "session", SESSION_PERIOD_SEC, entry.get("percent"), now)
+        elif key == "weekly":
+            entry["resetsAt"] = reset_iso(state, "weekly", WEEKLY_PERIOD_SEC, entry.get("percent"), now)
+    state["prev"] = {
+        "at": now,
+        "session": next((l["percent"] for l in limits if l.get("title") == "Session"), None),
+        "weekly": next((l["percent"] for l in limits if l.get("title") == "Weekly"), None),
+    }
+    save_reset_state(state)
+    return record
 
 
 def _key_source_paths(cli_key_file: str) -> list[str]:
@@ -243,6 +358,13 @@ def main(argv: list[str] | None = None) -> int:
         "otherwise $OLLAMA_CLOUD_API_KEY, ~/.config/ollama-cloud-usage/api-key, "
         "or ~/.dsh/.credentials.yaml",
     )
+    parser.add_argument(
+        "--seed-resets", action="append", default=[], metavar="WINDOW=DURATION",
+        help="one-off anchor seed read from ollama.com/settings, e.g. "
+        "--seed-resets session=52m --seed-resets weekly=4d6h; the collector "
+        "extrapolates the next resets afterwards and re-pins them whenever "
+        "an observed usage drop proves the window rolled",
+    )
     args = parser.parse_args(argv)
 
     if args.clear:
@@ -251,8 +373,13 @@ def main(argv: list[str] | None = None) -> int:
             os.remove(target)
         return 0
 
+    if args.seed_resets:
+        seed_resets(args.seed_resets)
+
     try:
         record = collect_record(args.api_key_file)
+        if record.get("ready"):
+            record = apply_reset_anchors(record)
     except (RuntimeError, ValueError, OSError) as exc:
         print(f"ollama-cloud-usage: {exc}", file=sys.stderr)
         if os.path.exists(usage_record_path()):
